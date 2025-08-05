@@ -64,6 +64,10 @@
                 {{ session.timeslot.instructor }}
                 <br />
                 {{ session.timeslot.location }}
+                <br v-if="session.timeslot.blockType" />
+                <span v-if="session.timeslot.blockType">{{
+                  function_call(crn)
+                }}</span>
               </div>
             </div>
 

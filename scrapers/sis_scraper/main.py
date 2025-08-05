@@ -25,6 +25,127 @@ BeautifulSoup = lambda data: bs4.BeautifulSoup(data, features="lxml")
 session = None
 
 
+class BlockLocation:
+    def __init__(self, semester):
+        self.semester = semester
+        self.block_url = f"https://sis.rpi.edu/reg/zs{semester}.htm"
+
+    async def fetch_html(self):
+        global session
+        async with session.get(self.block_url) as response:
+            return await response.text()
+
+    async def find_class_type(self, crn):
+        """
+        Find the class type for a given CRN.
+
+        Args:
+            crn (str): The CRN of the class.
+
+        Returns:
+            list: A list of blocks associated with the CRN, or a string message if no blocks are found.
+        """
+        html_content = await self.fetch_html()
+
+        soup = BeautifulSoup(html_content)
+
+        rows = soup.find_all('tr', {'align': 'LEFT'})
+        all_rows = []
+
+        for row in rows:
+            columns = [col.text.strip() for col in row.find_all('td')]
+            all_rows.append(columns)
+
+        section_blocks = []
+        capturing = False
+
+        for columns in all_rows:
+            if len(columns) == 0:
+                continue
+
+            first_column_text = columns[0]
+
+            if first_column_text.startswith(crn):
+                capturing = True
+                section_blocks.append(columns)
+                continue
+
+            if capturing and first_column_text == "":
+                section_blocks.append(columns)
+
+            elif capturing and first_column_text != "":
+                break
+
+        if section_blocks:
+            return section_blocks
+        else:
+            return "CRN not found or no blocks associated."
+
+    async def get_block_types(self, crn):
+        """
+        Get the block types for a given CRN.
+
+        Args:
+            crn (str): The CRN of the class.
+
+        Returns:
+            dict: A dictionary mapping days to block types, or a string message if no blocks are found.
+        """
+        section_blocks = await self.find_class_type(crn)
+
+        if isinstance(section_blocks, str):
+            return section_blocks
+
+        schedule = {
+            'Monday': [],
+            'Tuesday': [],
+            'Wednesday': [],
+            'Thursday': [],
+            'Friday': [],
+        }
+
+        block_details = []
+
+        for block in section_blocks:
+            # Skip blocks with insufficient data
+            if len(block) < 11:
+                continue
+
+            block_type = block[2]
+            block_days = block[6]
+            block_start = block[7]
+            block_end = block[8]
+            block_location = block[9]
+            block_teacher = block[10]
+
+            block_info = {
+                'type': block_type,
+                'days': block_days,
+                'start': block_start,
+                'end': block_end,
+                'location': block_location,
+                'teacher': block_teacher
+            }
+
+            block_details.append(block_info)
+
+            if 'M' in block_days:
+                schedule['Monday'].append(block_type)
+            if 'T' in block_days:
+                schedule['Tuesday'].append(block_type)
+            if 'W' in block_days:
+                schedule['Wednesday'].append(block_type)
+            if 'R' in block_days:
+                schedule['Thursday'].append(block_type)
+            if 'F' in block_days:
+                schedule['Friday'].append(block_type)
+
+        return {
+            'schedule': schedule,
+            'block_details': block_details
+        }
+
+
 async def get_section_information(section_url):
     global session
     section_dict = {}
@@ -362,6 +483,12 @@ async def scrape_term(term):
     date_to_quacs = lambda date: (
         f"{str(date.month).zfill(2)}/{str(date.day).zfill(2)}" if date != None else ""
     )
+
+    # Create a BlockLocation instance for this term
+    block_location = BlockLocation(term)
+
+    # First, collect all sections and process prerequisites
+    all_sections = []
     for dept in courses:
         for course in dept["courses"]:
             for section in course["sections"]:
@@ -370,9 +497,37 @@ async def scrape_term(term):
                     del section["prereqs"]
                 except:
                     prerequisites[section["crn"]] = {}
+                all_sections.append(section)
+
+    # Fetch block type information for all sections in parallel
+    async def fetch_block_info(section):
+        try:
+            block_info = await block_location.get_block_types(str(section["crn"]))
+            if isinstance(block_info, dict) and "block_details" in block_info:
+                # Map block details to timeslots based on days and times
                 for timeslot in section["timeslots"]:
-                    timeslot["dateStart"] = date_to_quacs(timeslot["dateStart"])
-                    timeslot["dateEnd"] = date_to_quacs(timeslot["dateEnd"])
+                    for block_detail in block_info["block_details"]:
+                        # Convert military time to match timeslot format
+                        block_start = int("".join(block_detail["start"].split(":"))[:4])
+                        block_end = int("".join(block_detail["end"].split(":"))[:4])
+
+                        # Check if this block matches the timeslot
+                        if (timeslot["timeStart"] == block_start and 
+                            timeslot["timeEnd"] == block_end and
+                            all(day in block_detail["days"] for day in timeslot["days"])):
+                            timeslot["blockType"] = block_detail["type"]
+                            break
+        except Exception as e:
+            print(f"Error getting block type for CRN {section['crn']}: {e}")
+
+    # Use asyncio.gather to fetch block info for all sections in parallel
+    await asyncio.gather(*[fetch_block_info(section) for section in all_sections])
+
+    # Process dates for all sections
+    for section in all_sections:
+        for timeslot in section["timeslots"]:
+            timeslot["dateStart"] = date_to_quacs(timeslot["dateStart"])
+            timeslot["dateEnd"] = date_to_quacs(timeslot["dateEnd"])
 
     with open(f"data/{term}/schools.json", "w") as schools_f:
         json.dump(school_columns, schools_f, sort_keys=False, indent=2)
@@ -432,6 +587,25 @@ async def scrape_subject_catalog(term, search_subj):
         return catalog
 
 
+async def test_block_location(semester, crn, get_types=True):
+    """
+    Test function to find the class type for a given CRN.
+
+    Args:
+        semester (str): The semester in the format "YYYYMM".
+        crn (str): The CRN of the class.
+        get_types (bool): Whether to use get_block_types or find_class_type.
+
+    Returns:
+        The class type information.
+    """
+    block_location = BlockLocation(semester)
+    if get_types:
+        return await block_location.get_block_types(crn)
+    else:
+        return await block_location.find_class_type(crn)
+
+
 async def main():
     if sys.argv[-1] == "help" or sys.argv[-1] == "--help":
         print(f"USAGE: python3 {sys.argv[0]} [ALL_YEARS]")
@@ -461,6 +635,19 @@ async def main():
         elif len(sys.argv[-1]) == 6:
             print(f"Parsing {sys.argv[-1]} only")
             semesters = [sys.argv[-1]]
+        elif sys.argv[-1] == "test_block" or sys.argv[-1] == "test_block_raw":
+            # Test the BlockLocation class
+            if len(sys.argv) < 4:
+                print(f"USAGE: python3 {sys.argv[0]} test_block <semester> <crn>")
+                print(f"       python3 {sys.argv[0]} test_block_raw <semester> <crn>")
+                sys.exit(1)
+            semester = sys.argv[-3]
+            crn = sys.argv[-2]
+            get_types = sys.argv[-1] == "test_block"
+            print(f"Testing BlockLocation for semester {semester} and CRN {crn}")
+            result = await test_block_location(semester, crn, get_types)
+            print(result)
+            return
         else:
             print("Parsing relevant terms only")
 

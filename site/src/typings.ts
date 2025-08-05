@@ -11,6 +11,7 @@ export interface Timeslot {
   dateStart: string;
   dateEnd: string;
   location: string;
+  blockType?: string;
 }
 
 export interface CourseSection {
